@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install -r \"/c/Users/AIPC/Documents/AI projects/build-your-battle/requirements.txt\")",
+      "Bash(python main.py)"
+    ]
+  }
+}
