@@ -1,0 +1,70 @@
+{
+  "games": [
+    {
+      "name": "A 1 V 1 Racing Game",
+      "description": "Fallback: a 1 v 1 racing game",
+      "mode": "quick_duel",
+      "hp_mult": 1.2,
+      "damage_mult": 1.8,
+      "speed_mult": 1.1,
+      "gravity_mult": 0.8,
+      "time_limit": 0,
+      "win_condition": "first_to_kos",
+      "target_kos": 3,
+      "arena_tier": 1,
+      "allowed_abilities": [
+        "double_jump",
+        "reflect",
+        "ground_slam",
+        "heal_pulse",
+        "extra_shields"
+      ],
+      "source": "ai",
+      "id": "a_1_v_1_racing_game"
+    },
+    {
+      "name": "Racing Game",
+      "description": "Fallback: racing game",
+      "mode": "classic",
+      "hp_mult": 1.2,
+      "damage_mult": 1.4,
+      "speed_mult": 1.2,
+      "gravity_mult": 1.2,
+      "time_limit": 0,
+      "win_condition": "first_to_kos",
+      "target_kos": 2,
+      "arena_tier": 1,
+      "allowed_abilities": [
+        "double_jump",
+        "reflect",
+        "ground_slam",
+        "heal_pulse",
+        "extra_shields"
+      ],
+      "source": "ai",
+      "id": "racing_game"
+    },
+    {
+      "name": "Demo 1",
+      "description": "Fallback: Demo 1",
+      "mode": "survival",
+      "hp_mult": 1.5,
+      "damage_mult": 1.0,
+      "speed_mult": 1.25,
+      "gravity_mult": 1.0,
+      "time_limit": 120,
+      "win_condition": "first_to_kos",
+      "target_kos": 3,
+      "arena_tier": -1,
+      "allowed_abilities": [
+        "double_jump",
+        "reflect",
+        "ground_slam",
+        "heal_pulse",
+        "extra_shields"
+      ],
+      "source": "custom",
+      "id": "demo_1"
+    }
+  ]
+}

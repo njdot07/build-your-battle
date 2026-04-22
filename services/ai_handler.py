@@ -111,6 +111,109 @@ def _validate(raw: dict, description: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# GAME-CONFIG generator (used by request_game)
+# ---------------------------------------------------------------------------
+GAME_SYSTEM_PROMPT = (
+    "You are a game-mode generator for a 2D arena brawler.  Given a "
+    "short description of a fight the player wants, respond with a "
+    "SINGLE JSON object ONLY — no prose, no code fences.  Schema:\n"
+    "{\n"
+    '  "name": string (1-26 chars, catchy),\n'
+    '  "description": string (under 80 chars),\n'
+    '  "mode": one of ["classic","quick_duel","survival"],\n'
+    '  "hp_mult": number 0.25-3.0,\n'
+    '  "damage_mult": number 0.25-3.0,\n'
+    '  "speed_mult": number 0.5-2.0,\n'
+    '  "gravity_mult": number 0.3-1.8,\n'
+    '  "time_limit": int 0-600 (seconds; 0 = unlimited),\n'
+    '  "win_condition": one of ["waves","first_to_kos","survival_time"],\n'
+    '  "target_kos": int 1-10,\n'
+    '  "arena_tier": int -1 to 5 (-1 = auto),\n'
+    '  "allowed_abilities": subset of '
+    '["double_jump","reflect","ground_slam","heal_pulse","extra_shields"]\n'
+    "}\n"
+    "Keep the rules coherent with the description.  For chaotic fights "
+    "use high damage, low HP.  For slow duels use high HP, low damage. "
+    "Do not include any extra keys or text."
+)
+
+
+def _validate_game(raw: dict, description: str) -> dict:
+    """Clamp AI output into a safe GameConfig-shaped dict."""
+    modes = ("classic", "quick_duel", "survival")
+    wins = ("waves", "first_to_kos", "survival_time")
+    abilities = ("double_jump", "reflect", "ground_slam",
+                 "heal_pulse", "extra_shields")
+
+    mode = raw.get("mode", "quick_duel")
+    if mode not in modes:
+        mode = "quick_duel"
+    win = raw.get("win_condition", "first_to_kos")
+    if win not in wins:
+        win = "first_to_kos"
+
+    allowed = raw.get("allowed_abilities", list(abilities))
+    if not isinstance(allowed, list):
+        allowed = list(abilities)
+    allowed = [a for a in allowed if a in abilities]
+    if not allowed:
+        allowed = list(abilities)
+
+    def num(v, lo, hi, default):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return default
+
+    def ival(v, lo, hi, default):
+        try:
+            return max(lo, min(hi, int(v)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "name":             str(raw.get("name", "AI Game"))[:26].strip() or "AI Game",
+        "description":      str(raw.get("description", description))[:80],
+        "mode":             mode,
+        "hp_mult":          num(raw.get("hp_mult", 1.0), 0.25, 3.0, 1.0),
+        "damage_mult":      num(raw.get("damage_mult", 1.0), 0.25, 3.0, 1.0),
+        "speed_mult":       num(raw.get("speed_mult", 1.0), 0.5, 2.0, 1.0),
+        "gravity_mult":     num(raw.get("gravity_mult", 1.0), 0.3, 1.8, 1.0),
+        "time_limit":       ival(raw.get("time_limit", 0), 0, 600, 0),
+        "win_condition":    win,
+        "target_kos":       ival(raw.get("target_kos", 3), 1, 10, 3),
+        "arena_tier":       ival(raw.get("arena_tier", -1), -1, 5, -1),
+        "allowed_abilities": allowed,
+        "source":           "ai",
+        "user_description": description,
+    }
+
+
+def _fallback_game(description: str, reason: str) -> dict:
+    """Offline-safe game config — picks sensible defaults."""
+    seed = sum(ord(c) for c in description) or 1
+    rng = random.Random(seed)
+    return {
+        "name":             (description[:20].title() or "Offline Game"),
+        "description":      f"Fallback: {description[:40]}",
+        "mode":             rng.choice(["quick_duel", "classic"]),
+        "hp_mult":           round(rng.uniform(0.5, 1.5), 1),
+        "damage_mult":       round(rng.uniform(0.8, 2.0), 1),
+        "speed_mult":        round(rng.uniform(0.8, 1.4), 1),
+        "gravity_mult":      round(rng.uniform(0.6, 1.2), 1),
+        "time_limit":        rng.choice([0, 0, 60, 120]),
+        "win_condition":     "first_to_kos",
+        "target_kos":        rng.choice([2, 3, 5]),
+        "arena_tier":        rng.choice([-1, 1, 2]),
+        "allowed_abilities": ["double_jump", "reflect", "ground_slam",
+                              "heal_pulse", "extra_shields"],
+        "source":            "fallback",
+        "user_description":  description,
+        "fallback_reason":   reason,
+    }
+
+
 def _fallback_character(description: str, reason: str) -> dict:
     """Deterministic-ish fallback so the game still works offline."""
     seed = sum(ord(c) for c in description) or 1
@@ -182,11 +285,7 @@ class AIHandler:
 
     # -- public API --------------------------------------------------------
     def request_character(self, description: str) -> None:
-        """Kick off a character-generation request.  Non-blocking.
-
-        If a previous request is still running, this call is ignored —
-        callers should check `is_busy()` first.
-        """
+        """Kick off a character-generation request.  Non-blocking."""
         if self.is_busy():
             return
         description = (description or "").strip()
@@ -195,30 +294,49 @@ class AIHandler:
                 "anonymous", "empty description"))
             return
         self._worker = threading.Thread(
-            target=self._worker_fn, args=(description,), daemon=True)
+            target=self._run, args=("character", description,), daemon=True)
+        self._worker.start()
+
+    def request_game(self, description: str) -> None:
+        """Kick off a game-config generation request.  Non-blocking."""
+        if self.is_busy():
+            return
+        description = (description or "").strip()
+        if not description:
+            self._queue.put(_fallback_game("anonymous", "empty description"))
+            return
+        self._worker = threading.Thread(
+            target=self._run, args=("game", description,), daemon=True)
         self._worker.start()
 
     def is_busy(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
 
     def poll(self) -> dict | None:
-        """Return the next completed result or None if none is ready."""
         try:
             return self._queue.get_nowait()
         except queue.Empty:
             return None
 
     # -- worker -----------------------------------------------------------
-    def _worker_fn(self, description: str) -> None:
+    def _run(self, kind: str, description: str) -> None:
+        if kind == "character":
+            sys_prompt = SYSTEM_PROMPT
+            fallback = _fallback_character
+            validator = _validate
+        else:  # "game"
+            sys_prompt = GAME_SYSTEM_PROMPT
+            fallback = _fallback_game
+            validator = _validate_game
         try:
             payload = {
                 "model": "local-model",
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user",   "content": f"Description: {description}"},
                 ],
                 "temperature": 0.8,
-                "max_tokens": 300,
+                "max_tokens": 400,
             }
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
@@ -232,14 +350,14 @@ class AIHandler:
                 .get("message", {}).get("content", "")
             parsed = _extract_json(content)
             if parsed is None:
-                self._queue.put(_fallback_character(
+                self._queue.put(fallback(
                     description, "LLM returned non-JSON output"))
                 return
-            self._queue.put(_validate(parsed, description))
+            self._queue.put(validator(parsed, description))
         except (urllib.error.URLError, urllib.error.HTTPError,
                 TimeoutError, ConnectionError, OSError) as e:
-            self._queue.put(_fallback_character(
+            self._queue.put(fallback(
                 description, f"LM Studio unreachable: {e}"))
         except Exception as e:  # noqa: BLE001 — final safety net
-            self._queue.put(_fallback_character(
+            self._queue.put(fallback(
                 description, f"Unexpected error: {e}"))

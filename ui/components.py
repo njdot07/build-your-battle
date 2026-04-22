@@ -66,15 +66,14 @@ class TextInput:
 
     def handle_event(self, event) -> bool:
         """Return True if the event was consumed by the input."""
-        if not self.focused:
-            return False
-
+        # Mouse clicks always control focus — this lets you click
+        # back into the input after focus was lost elsewhere.
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            # Clicking on us grabs focus; clicking outside loses it.
             self.focused = self.rect.collidepoint(event.pos)
             return self.focused
 
-        if event.type != pygame.KEYDOWN:
+        # Keyboard events only matter when we have focus.
+        if not self.focused or event.type != pygame.KEYDOWN:
             return False
 
         if event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER:

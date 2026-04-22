@@ -10,6 +10,7 @@ import math
 import pygame
 
 from services.ai_handler import AIHandler
+from services.game_storage import GameLibrary, GameConfig, VALID_ABILITIES
 from ui.components import TextInput, ParallaxManager
 from settings import (
     SCREEN_WIDTH, SCREEN_HEIGHT, FPS, TITLE,
@@ -1076,6 +1077,20 @@ def main():
     btn_theme_prev = btn_theme_next = btn_start = None
     char_card_rects = [None] * len(CHARACTERS)
 
+    # -------- Games Hub (user-created game modes) --------
+    game_library = GameLibrary.load()
+    active_game = game_library.games[0]   # currently-selected game
+    games_hub_scroll = 0                  # scroll offset
+    game_card_rects = []                  # click targets (rebuilt each draw)
+    game_play_btns = []
+    game_edit_btns = []
+    game_delete_btns = []
+    btn_new_game = btn_ai_game = None
+    editing_game = None                   # GameConfig being edited (or None for new)
+    builder_inputs = {}                   # name input, etc — lazy init
+    ai_game_input = None                  # TextInput for game description
+    ai_game_result = None                 # dict returned from ai.poll()
+
     # -------- Character Forge (AI-driven character creator) --------
     ai = AIHandler()
     parallax = ParallaxManager(SCREEN_WIDTH, SCREEN_HEIGHT, GROUND_Y)
@@ -1113,12 +1128,16 @@ def main():
     btn_forge_fight = btn_forge_menu = None
 
     def apply_upgrades():
-        """Return the active character's data with their specific upgrades."""
+        """Return the active character's data with upgrades + game rules."""
         base = dict(player_roster[p1_choice])
         char_ups = _get_upgrades(base["name"])
         for info in FORGE_UPGRADES:
             stat = info["stat"]
             base[stat] = base[stat] + info["amount"] * char_ups[stat]
+        # Apply the currently-selected game's multipliers
+        base["health"] = max(1, int(base["health"] * active_game.hp_mult))
+        base["attack"] = max(1, int(base["attack"] * active_game.damage_mult))
+        base["speed"] = max(1, base["speed"] * active_game.speed_mult)
         return base
 
     def start_fight():
@@ -1129,12 +1148,19 @@ def main():
         char_data = apply_upgrades()
         player = Fighter(150, char_data, p1_controls, facing=1, is_player=True)
         player.abilities = set(unlocked_abilities)
-        if "extra_shields" in unlocked_abilities:
+        # Filter player abilities by what the active game allows
+        player.abilities = (set(unlocked_abilities)
+                            & set(active_game.allowed_abilities))
+        if "extra_shields" in player.abilities:
             player.block_charges = BLOCK_CHARGES_BASE + BLOCK_CHARGES_UPGRADE
         npc_data, is_boss_wave = build_npc_data(CHARACTERS[npc_choice], wave)
+        # Apply active game multipliers to the NPC as well
+        npc_data["health"] = max(1, int(npc_data["health"] * active_game.hp_mult))
+        npc_data["attack"] = max(1, int(npc_data["attack"] * active_game.damage_mult))
+        npc_data["speed"] = max(1, npc_data["speed"] * active_game.speed_mult)
         npc = Fighter(550, npc_data, npc_controls, facing=-1)
         npc.is_boss = is_boss_wave
-        if is_boss_wave:
+        if is_boss_wave and active_game.mode == "classic":
             npc.boss_ability_type = boss_ability_for_wave(wave)
         projectiles.clear()
         particles.clear()
@@ -1221,6 +1247,9 @@ def main():
                         state = "select"
                         p1_choice = 0
                         npc_choice = random.randint(0, len(CHARACTERS) - 1)
+                    elif event.key == pygame.K_g:
+                        # Open the Games Hub
+                        state = "games_hub"
                     elif event.key == pygame.K_f:
                         # Open the AI Character Forge
                         state = "char_forge"
@@ -1285,6 +1314,65 @@ def main():
                     elif event.key == pygame.K_ESCAPE:
                         state = "menu"
 
+                elif state == "games_hub":
+                    if event.key == pygame.K_ESCAPE:
+                        state = "menu"
+                    elif event.key == pygame.K_n:
+                        editing_game = None
+                        builder_inputs = {}
+                        state = "game_builder"
+                    elif event.key == pygame.K_g and ai_game_input is None:
+                        # open AI generator
+                        ai_game_input = TextInput(
+                            (80, 240, 640, 52),
+                            pygame.font.SysFont(None, 26),
+                            max_chars=80,
+                            placeholder="Pace / intensity / feel — e.g. 'frantic low-HP duel'")
+                        ai_game_input.focused = True
+                        ai_game_result = None
+                        state = "game_ai_gen"
+
+                elif state == "game_builder":
+                    ti = builder_inputs.get("name_input")
+                    if ti and ti.focused:
+                        ti.handle_event(event)
+                    if event.key == pygame.K_ESCAPE:
+                        state = "games_hub"
+                        builder_inputs = {}
+
+                elif state == "game_ai_gen":
+                    if ai_game_input is not None:
+                        consumed = ai_game_input.handle_event(event)
+                        if consumed and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            if not ai.is_busy() and ai_game_input.text.strip():
+                                ai.request_game(ai_game_input.text)
+                                ai_game_result = None
+                        elif event.key == pygame.K_s and ai_game_result is not None:
+                            # Save the AI-generated game to library
+                            cfg = GameConfig(
+                                name=ai_game_result["name"],
+                                description=ai_game_result.get("description", ""),
+                                mode=ai_game_result["mode"],
+                                hp_mult=ai_game_result["hp_mult"],
+                                damage_mult=ai_game_result["damage_mult"],
+                                speed_mult=ai_game_result["speed_mult"],
+                                gravity_mult=ai_game_result["gravity_mult"],
+                                time_limit=ai_game_result["time_limit"],
+                                win_condition=ai_game_result["win_condition"],
+                                target_kos=ai_game_result["target_kos"],
+                                arena_tier=ai_game_result["arena_tier"],
+                                allowed_abilities=ai_game_result["allowed_abilities"],
+                                source="ai",
+                            )
+                            game_library.add(cfg)
+                            game_library.save()
+                            state = "games_hub"
+                            ai_game_input = None
+                            ai_game_result = None
+                        elif event.key == pygame.K_ESCAPE and not consumed:
+                            state = "games_hub"
+                            ai_game_input = None
+
                 elif state == "pause":
                     if event.key == pygame.K_ESCAPE:
                         state = "fight"
@@ -1340,6 +1428,84 @@ def main():
                     if story_page >= len(STORY_PAGES):
                         has_seen_intro = True
                         state = "menu"
+                elif state == "games_hub":
+                    # New game / AI gen buttons
+                    if btn_new_game and btn_new_game.collidepoint(mouse_pos):
+                        editing_game = None
+                        builder_inputs = {}
+                        state = "game_builder"
+                    elif btn_ai_game and btn_ai_game.collidepoint(mouse_pos):
+                        ai_game_input = TextInput(
+                            (80, 240, 640, 52),
+                            pygame.font.SysFont(None, 26),
+                            max_chars=80,
+                            placeholder="Pace / intensity / feel — e.g. 'frantic low-HP duel'")
+                        ai_game_input.focused = True
+                        ai_game_result = None
+                        state = "game_ai_gen"
+                    else:
+                        # Per-card buttons
+                        for i, (pb, eb, db) in enumerate(
+                            zip(game_play_btns, game_edit_btns, game_delete_btns)):
+                            g = game_library.games[i]
+                            if pb and pb.collidepoint(mouse_pos):
+                                active_game = g
+                                state = "select"
+                                p1_choice = 0
+                                npc_choice = random.randint(0, len(CHARACTERS) - 1)
+                                break
+                            if eb and eb.collidepoint(mouse_pos):
+                                if g.source != "builtin":
+                                    editing_game = g
+                                    builder_inputs = {}
+                                    state = "game_builder"
+                                break
+                            if db and db.collidepoint(mouse_pos):
+                                if game_library.delete(g.id):
+                                    game_library.save()
+                                break
+
+                elif state == "game_builder":
+                    # Let the name TextInput grab focus / clicks first
+                    ti = builder_inputs.get("name_input")
+                    if ti:
+                        ti.handle_event(event)
+                    # Per-option toggles
+                    for rect, cb in builder_inputs.get("_option_clicks", []):
+                        if rect.collidepoint(mouse_pos):
+                            cb()
+                            break
+                    # Save / Cancel / AI Flavor
+                    if builder_inputs.get("_btn_save") \
+                            and builder_inputs["_btn_save"].collidepoint(mouse_pos):
+                        draft = builder_inputs.get("draft")
+                        if draft and ti and ti.text.strip():
+                            draft.name = ti.text
+                            draft.validate()
+                            # Persist (edit or new)
+                            if editing_game:
+                                editing_game.__dict__.update(draft.__dict__)
+                                game_library.add(editing_game)
+                            else:
+                                game_library.add(draft)
+                            game_library.save()
+                            state = "games_hub"
+                            builder_inputs = {}
+                    elif builder_inputs.get("_btn_cancel") \
+                            and builder_inputs["_btn_cancel"].collidepoint(mouse_pos):
+                        state = "games_hub"
+                        builder_inputs = {}
+                    elif builder_inputs.get("_btn_flavor") \
+                            and builder_inputs["_btn_flavor"].collidepoint(mouse_pos):
+                        # Use the current name as the AI prompt
+                        if not ai.is_busy() and ti and ti.text.strip():
+                            ai.request_game(ti.text)
+                            ai_requested_at = now
+
+                elif state == "game_ai_gen":
+                    if ai_game_input is not None:
+                        ai_game_input.handle_event(event)
+
                 elif state == "char_forge":
                     forge_text_input.handle_event(event)
                     if btn_forge_submit and btn_forge_submit.collidepoint(mouse_pos):
@@ -1422,8 +1588,23 @@ def main():
             result = ai.poll()
             if result is not None:
                 ai_character = result
-                # Rebuild parallax with the returned theme for instant preview
                 parallax.set_theme(ai_character.get("theme", "arcane"))
+
+        if state == "game_ai_gen":
+            result = ai.poll()
+            if result is not None:
+                ai_game_result = result
+
+        if state == "game_builder":
+            # AI Flavor: only consume name/description, keep user's rules.
+            result = ai.poll()
+            if result is not None and builder_inputs.get("draft"):
+                draft = builder_inputs["draft"]
+                draft.name = result.get("name", draft.name)[:26]
+                draft.description = result.get("description", "")[:80]
+                ti = builder_inputs.get("name_input")
+                if ti:
+                    ti.set_text(draft.name)
 
         if state == "countdown":
             if (now - state_timer) / 1000.0 >= COUNTDOWN_TIME + 0.5:
@@ -1767,6 +1948,10 @@ def main():
                 "Press F for AI Character Forge", True, theme["accent"])
             screen.blit(forge_prompt, forge_prompt.get_rect(
                 center=(SCREEN_WIDTH // 2, 500)))
+            hub_prompt = font_small.render(
+                "Press G for Games Hub  (create your own)", True, theme["accent2"])
+            screen.blit(hub_prompt, hub_prompt.get_rect(
+                center=(SCREEN_WIDTH // 2, 525)))
             tip = font_tiny.render(
                 f"Theme: {theme['name']}  (change on customize screen)",
                 True, theme["text_dim"])
@@ -2231,6 +2416,424 @@ def main():
                 screen, font_small, "Back  [ESC]",
                 SCREEN_WIDTH // 2 + 120, 560,
                 theme["text_dim"], theme["bg2"])
+
+        elif state == "games_hub":
+            # ── Games Hub: list all games, pick / create / delete ─────
+            theme = UI_THEMES[ui_theme_idx]
+            screen.fill(theme["bg"])
+            pygame.draw.rect(screen, theme["bg2"],
+                             (0, SCREEN_HEIGHT // 2, SCREEN_WIDTH, SCREEN_HEIGHT // 2))
+
+            # Title bar
+            title = font_large.render("GAMES HUB", True, theme["accent"])
+            screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 40)))
+            sub = font_small.render(
+                f"{len(game_library.games)} games available — choose one, edit, or build your own",
+                True, theme["text_dim"])
+            screen.blit(sub, sub.get_rect(center=(SCREEN_WIDTH // 2, 72)))
+
+            # New / AI buttons up top
+            btn_new_game = draw_button(
+                screen, font_small, "+ NEW GAME  [N]",
+                SCREEN_WIDTH // 2 - 110, 105,
+                theme["button_fg"], theme["button_bg"])
+            btn_ai_game = draw_button(
+                screen, font_small, "AI TUNE RULES  [G]",
+                SCREEN_WIDTH // 2 + 110, 105,
+                theme["accent2"], theme["button_bg"])
+
+            # Scrollable card list
+            game_play_btns = [None] * len(game_library.games)
+            game_edit_btns = [None] * len(game_library.games)
+            game_delete_btns = [None] * len(game_library.games)
+
+            card_y0 = 150
+            card_h = 96
+            card_w = SCREEN_WIDTH - 80
+            for i, g in enumerate(game_library.games):
+                cy = card_y0 + i * (card_h + 10)
+                if cy + card_h > SCREEN_HEIGHT - 30:
+                    break
+                card = pygame.Rect(40, cy, card_w, card_h)
+                pygame.draw.rect(screen, theme["panel"], card, border_radius=8)
+                pygame.draw.rect(screen, theme["border"], card, 2, border_radius=8)
+
+                # source badge (top-left)
+                badge_col = {"builtin": theme["text_dim"],
+                             "custom":  theme["accent"],
+                             "ai":      theme["accent2"]}.get(g.source, GRAY)
+                badge = font_tiny.render(g.source.upper(), True, badge_col)
+                screen.blit(badge, (card.x + 16, card.y + 10))
+
+                # name
+                nm = font_med.render(g.name, True, theme["text"])
+                screen.blit(nm, (card.x + 16, card.y + 28))
+
+                # description — below name with clear spacing
+                desc = font_tiny.render(g.description or " ", True, theme["text_dim"])
+                screen.blit(desc, (card.x + 16, card.y + 56))
+
+                # rules summary — at the bottom of the card
+                rs = font_tiny.render(g.summary(), True, theme["accent"])
+                screen.blit(rs, (card.x + 16, card.y + 74))
+
+                # play / edit / delete buttons on the right
+                game_play_btns[i] = draw_button(
+                    screen, font_tiny, "PLAY",
+                    card.right - 240, card.centery,
+                    theme["button_fg"], theme["button_bg"])
+                if g.source != "builtin":
+                    game_edit_btns[i] = draw_button(
+                        screen, font_tiny, "EDIT",
+                        card.right - 140, card.centery,
+                        theme["text"], (50, 50, 60))
+                    game_delete_btns[i] = draw_button(
+                        screen, font_tiny, "DELETE",
+                        card.right - 50, card.centery,
+                        (220, 80, 80), (50, 30, 30))
+
+            # back hint
+            back_hint = font_tiny.render(
+                "ESC — back to menu", True, theme["text_dim"])
+            screen.blit(back_hint, back_hint.get_rect(
+                midbottom=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 8)))
+
+        elif state == "game_builder":
+            # ── Multi-layer game builder — real controls, real choices ──
+            theme = UI_THEMES[ui_theme_idx]
+            screen.fill(theme["bg"])
+            pygame.draw.rect(screen, theme["bg2"],
+                             (0, SCREEN_HEIGHT // 2, SCREEN_WIDTH, SCREEN_HEIGHT // 2))
+
+            # Lazy-init the form state (draft) + name input
+            if "draft" not in builder_inputs:
+                if editing_game:
+                    draft = GameConfig(
+                        name=editing_game.name,
+                        description=editing_game.description,
+                        mode=editing_game.mode,
+                        hp_mult=editing_game.hp_mult,
+                        damage_mult=editing_game.damage_mult,
+                        speed_mult=editing_game.speed_mult,
+                        gravity_mult=editing_game.gravity_mult,
+                        time_limit=editing_game.time_limit,
+                        win_condition=editing_game.win_condition,
+                        target_kos=editing_game.target_kos,
+                        arena_tier=editing_game.arena_tier,
+                        allowed_abilities=list(editing_game.allowed_abilities),
+                        source=editing_game.source or "custom",
+                        id=editing_game.id,
+                    )
+                else:
+                    draft = GameConfig(source="custom")
+                builder_inputs["draft"] = draft
+                ti = TextInput((40, 100, SCREEN_WIDTH - 80, 44),
+                               pygame.font.SysFont(None, 26),
+                               max_chars=26,
+                               placeholder="Name your game")
+                ti.set_text(draft.name if draft.name != "Unnamed Game" else "")
+                ti.focused = True
+                builder_inputs["name_input"] = ti
+
+            draft = builder_inputs["draft"]
+            ti = builder_inputs["name_input"]
+            # Keep draft.name in sync with text input
+            draft.name = ti.text or "Unnamed Game"
+
+            # -- Title --
+            title = font_large.render(
+                "EDIT GAME" if editing_game else "NEW GAME", True, theme["accent"])
+            screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 36)))
+            sub = font_tiny.render(
+                "Build your battle: mix rules, abilities and arena — then save.",
+                True, theme["text_dim"])
+            screen.blit(sub, sub.get_rect(center=(SCREEN_WIDTH // 2, 64)))
+
+            # -- Name input --
+            ti.draw(screen)
+
+            # Storage for per-button click rects (populated during draw,
+            # consumed by an inline click-check at the end of this block)
+            option_clicks = []  # list of (rect, callback)
+
+            def _opt(label, rect, selected, color_sel=None, color_fg=None,
+                     color_bg=None, on_click=None):
+                """Draw a small toggle/button option and register its click rect."""
+                sel = bool(selected)
+                fg = color_fg or (theme["accent"] if sel else theme["text"])
+                bg = color_bg or (theme["panel_hl"] if sel else theme["panel"])
+                pygame.draw.rect(screen, bg, rect, border_radius=5)
+                pygame.draw.rect(screen,
+                                 color_sel or theme["accent"] if sel else theme["border"],
+                                 rect, 2, border_radius=5)
+                lbl = font_tiny.render(label, True, fg)
+                screen.blit(lbl, lbl.get_rect(center=rect.center))
+                if on_click is not None:
+                    option_clicks.append((rect, on_click))
+
+            # Helper to make option rows
+            def _opt_row(row_y, label, choices, field):
+                """Draw a labeled row of options.  `choices` = [(label, value), ...]
+                `field` = attribute name on draft."""
+                screen.blit(font_tiny.render(label, True, theme["text_dim"]),
+                            (40, row_y + 5))
+                x = 160
+                for lbl, val in choices:
+                    w = 80
+                    rect = pygame.Rect(x, row_y, w, 26)
+                    sel = getattr(draft, field) == val
+                    def make_cb(f=field, v=val):
+                        def cb():
+                            setattr(draft, f, v)
+                        return cb
+                    _opt(lbl, rect, sel, on_click=make_cb())
+                    x += w + 6
+
+            # -- Template presets (quick-start) --
+            screen.blit(font_small.render("TEMPLATE", True, theme["text_dim"]),
+                        (40, 158))
+            templates = [
+                ("Brawler",  {"mode": "classic",    "win_condition": "waves",
+                              "hp_mult": 1.0, "damage_mult": 1.0,
+                              "speed_mult": 1.0, "gravity_mult": 1.0,
+                              "time_limit": 0, "target_kos": 3}),
+                ("Duel",     {"mode": "quick_duel", "win_condition": "first_to_kos",
+                              "hp_mult": 1.0, "damage_mult": 1.0,
+                              "speed_mult": 1.0, "gravity_mult": 1.0,
+                              "time_limit": 0, "target_kos": 3}),
+                ("Chaos",    {"mode": "quick_duel", "win_condition": "first_to_kos",
+                              "hp_mult": 0.5, "damage_mult": 2.0,
+                              "speed_mult": 1.3, "gravity_mult": 1.0,
+                              "time_limit": 60, "target_kos": 5}),
+                ("Tactical", {"mode": "quick_duel", "win_condition": "first_to_kos",
+                              "hp_mult": 2.0, "damage_mult": 0.7,
+                              "speed_mult": 0.9, "gravity_mult": 1.0,
+                              "time_limit": 120, "target_kos": 2}),
+                ("Moon",     {"mode": "quick_duel", "win_condition": "first_to_kos",
+                              "hp_mult": 1.0, "damage_mult": 1.0,
+                              "speed_mult": 1.2, "gravity_mult": 0.4,
+                              "time_limit": 0, "target_kos": 3}),
+            ]
+            tx = 160
+            for tname, preset in templates:
+                rect = pygame.Rect(tx, 156, 90, 26)
+                # "selected" if all preset fields match draft
+                is_sel = all(getattr(draft, k) == v for k, v in preset.items())
+                def make_apply(p=preset):
+                    def cb():
+                        for k, v in p.items():
+                            setattr(draft, k, v)
+                    return cb
+                _opt(tname, rect, is_sel, on_click=make_apply())
+                tx += 96
+
+            # -- Mode --
+            _opt_row(196, "MODE", [
+                ("Classic", "classic"),
+                ("Duel",    "quick_duel"),
+                ("Survive", "survival"),
+            ], "mode")
+
+            # -- HP, Damage, Speed, Gravity multipliers --
+            def _mult_row(y, label, field, opts):
+                screen.blit(font_tiny.render(label, True, theme["text_dim"]),
+                            (40, y + 5))
+                x = 160
+                for lbl, val in opts:
+                    rect = pygame.Rect(x, y, 54, 26)
+                    sel = abs(getattr(draft, field) - val) < 0.01
+                    def make_cb(f=field, v=val):
+                        def cb():
+                            setattr(draft, f, v)
+                        return cb
+                    _opt(lbl, rect, sel, on_click=make_cb())
+                    x += 60
+
+            _mult_row(230, "HP",
+                      "hp_mult", [("0.5x", 0.5), ("1x", 1.0),
+                                  ("1.5x", 1.5), ("2x", 2.0), ("3x", 3.0)])
+            _mult_row(264, "DMG",
+                      "damage_mult", [("0.5x", 0.5), ("1x", 1.0),
+                                      ("1.5x", 1.5), ("2x", 2.0), ("3x", 3.0)])
+            _mult_row(298, "SPD",
+                      "speed_mult", [("0.75x", 0.75), ("1x", 1.0),
+                                     ("1.25x", 1.25), ("1.5x", 1.5), ("2x", 2.0)])
+            _mult_row(332, "GRAV",
+                      "gravity_mult", [("0.4x", 0.4), ("0.7x", 0.7),
+                                       ("1x", 1.0), ("1.3x", 1.3), ("1.6x", 1.6)])
+
+            # -- Time limit & target KOs --
+            _opt_row(366, "TIME", [
+                ("None", 0), ("30s", 30), ("60s", 60), ("120s", 120), ("300s", 300),
+            ], "time_limit")
+            _opt_row(400, "KOs",  [
+                ("1", 1), ("3", 3), ("5", 5), ("10", 10),
+            ], "target_kos")
+
+            # -- Arena tier --
+            _opt_row(434, "ARENA", [
+                ("Auto", -1), ("T1", 1), ("T2", 2),
+                ("T3", 3), ("T4", 4), ("T5", 5),
+            ], "arena_tier")
+
+            # -- Abilities (multi-select toggles) --
+            screen.blit(font_small.render("ABILITIES", True, theme["text_dim"]),
+                        (40, 470))
+            ab_labels = {
+                "double_jump":   "Double Jump",
+                "reflect":       "Reflect",
+                "ground_slam":   "Ground Slam",
+                "heal_pulse":    "Heal Pulse",
+                "extra_shields": "Extra Shields",
+            }
+            ax = 160
+            for aid, alabel in ab_labels.items():
+                rect = pygame.Rect(ax, 468, 112, 26)
+                sel = aid in draft.allowed_abilities
+                def make_toggle(a=aid):
+                    def cb():
+                        if a in draft.allowed_abilities:
+                            draft.allowed_abilities.remove(a)
+                        else:
+                            draft.allowed_abilities.append(a)
+                    return cb
+                _opt(alabel, rect, sel, on_click=make_toggle())
+                ax += 118
+
+            # -- Summary strip --
+            temp = GameConfig(**{k: v for k, v in draft.__dict__.items()})
+            temp.validate()
+            summary_txt = temp.summary()
+            st = font_tiny.render("Summary: " + summary_txt,
+                                  True, theme["accent"])
+            screen.blit(st, (40, 510))
+
+            # -- Save / Cancel / AI Flavor buttons --
+            btn_save_rect = pygame.Rect(40, 548, 160, 36)
+            pygame.draw.rect(screen, theme["button_bg"], btn_save_rect, border_radius=6)
+            pygame.draw.rect(screen, theme["button_fg"], btn_save_rect, 2, border_radius=6)
+            screen.blit(font_small.render("SAVE", True, theme["button_fg"]),
+                        font_small.render("SAVE", True, theme["button_fg"]).get_rect(
+                            center=btn_save_rect.center))
+
+            btn_flavor_rect = pygame.Rect(220, 548, 200, 36)
+            flavor_enabled = not ai.is_busy() and ti.text.strip()
+            fl_bg = theme["button_bg"] if flavor_enabled else (40, 40, 40)
+            fl_fg = theme["accent2"] if flavor_enabled else (100, 100, 100)
+            pygame.draw.rect(screen, fl_bg, btn_flavor_rect, border_radius=6)
+            pygame.draw.rect(screen, fl_fg, btn_flavor_rect, 2, border_radius=6)
+            flabel = "AI FLAVOR" if not ai.is_busy() else "..."
+            screen.blit(font_small.render(flabel, True, fl_fg),
+                        font_small.render(flabel, True, fl_fg).get_rect(
+                            center=btn_flavor_rect.center))
+
+            btn_cancel_rect = pygame.Rect(SCREEN_WIDTH - 200, 548, 160, 36)
+            pygame.draw.rect(screen, (50, 50, 60), btn_cancel_rect, border_radius=6)
+            pygame.draw.rect(screen, theme["text_dim"], btn_cancel_rect, 2, border_radius=6)
+            screen.blit(font_small.render("CANCEL  [ESC]", True, theme["text_dim"]),
+                        font_small.render("CANCEL  [ESC]", True, theme["text_dim"]).get_rect(
+                            center=btn_cancel_rect.center))
+
+            # Save what we built into the clicks list via module state
+            builder_inputs["_option_clicks"] = option_clicks
+            builder_inputs["_btn_save"] = btn_save_rect
+            builder_inputs["_btn_cancel"] = btn_cancel_rect
+            builder_inputs["_btn_flavor"] = btn_flavor_rect
+
+        elif state == "game_ai_gen":
+            # ── AI Game Director ─────────────────────────────────────
+            theme = UI_THEMES[ui_theme_idx]
+            parallax.draw(screen, camera_x=menu_frame * 0.4)
+            scrim = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            scrim.fill((0, 0, 0, 140))
+            screen.blit(scrim, (0, 0))
+
+            title = font_large.render("AI BRAWLER TUNER", True, theme["accent"])
+            screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 60)))
+            sub = font_small.render(
+                "Tunes the existing brawler's rules — not a new game type.",
+                True, theme["text_dim"])
+            screen.blit(sub, sub.get_rect(center=(SCREEN_WIDTH // 2, 94)))
+            note = font_tiny.render(
+                "Describe pace, intensity, HP, speed, time limits — NOT genres like 'racing' or 'puzzle'.",
+                True, theme["accent2"])
+            screen.blit(note, note.get_rect(center=(SCREEN_WIDTH // 2, 120)))
+
+            if ai_game_input is not None:
+                lab = font_small.render("PROMPT", True, theme["text_dim"])
+                screen.blit(lab, (80, 215))
+                ai_game_input.draw(screen)
+
+            # Status + panel
+            status_y = 320
+            if ai.is_busy():
+                pulse = abs(math.sin(now * 0.005))
+                dot = int(pulse * 10) + 3
+                pygame.draw.circle(screen, theme["accent"],
+                                   (SCREEN_WIDTH // 2, status_y), dot)
+                msg = font_med.render("Consulting the director...",
+                                      True, theme["accent"])
+                screen.blit(msg, msg.get_rect(
+                    center=(SCREEN_WIDTH // 2, status_y + 40)))
+            elif ai_game_result is not None:
+                # Result preview panel
+                panel = pygame.Rect(60, status_y, SCREEN_WIDTH - 120, 210)
+                pygame.draw.rect(screen, theme["panel"], panel, border_radius=10)
+                pygame.draw.rect(screen, theme["border"], panel, 2,
+                                 border_radius=10)
+                nm = font_med.render(ai_game_result["name"],
+                                     True, theme["accent"])
+                screen.blit(nm, (panel.x + 18, panel.y + 12))
+                src = font_tiny.render(
+                    "AI" if ai_game_result["source"] == "ai" else "OFFLINE FALLBACK",
+                    True, (theme["accent"] if ai_game_result["source"] == "ai"
+                           else theme["text_dim"]))
+                screen.blit(src, src.get_rect(
+                    topright=(panel.right - 18, panel.y + 14)))
+                dsc = font_small.render(
+                    ai_game_result.get("description", "")[:70],
+                    True, theme["text_dim"])
+                screen.blit(dsc, (panel.x + 18, panel.y + 46))
+
+                # Show rules as a 2-column list
+                rules = [
+                    ("Mode", ai_game_result["mode"]),
+                    ("Win",  ai_game_result["win_condition"]),
+                    ("HP x", f"{ai_game_result['hp_mult']:.2f}"),
+                    ("DMG x", f"{ai_game_result['damage_mult']:.2f}"),
+                    ("SPD x", f"{ai_game_result['speed_mult']:.2f}"),
+                    ("GRAV x", f"{ai_game_result['gravity_mult']:.2f}"),
+                    ("Time", f"{ai_game_result['time_limit']}s"
+                             if ai_game_result['time_limit'] else "∞"),
+                    ("Target KOs", str(ai_game_result['target_kos'])),
+                ]
+                for i, (k, v) in enumerate(rules):
+                    col = i // 4
+                    row = i % 4
+                    rx = panel.x + 18 + col * 180
+                    ry = panel.y + 80 + row * 22
+                    screen.blit(font_tiny.render(k, True, theme["text_dim"]),
+                                (rx, ry))
+                    screen.blit(font_tiny.render(v, True, theme["text"]),
+                                (rx + 70, ry))
+
+                # Save to library button
+                save_hint = font_small.render(
+                    "Press S to save to your Games Hub",
+                    True, theme["accent"])
+                screen.blit(save_hint, save_hint.get_rect(
+                    center=(SCREEN_WIDTH // 2, panel.bottom + 20)))
+            else:
+                hint = font_small.render(
+                    "Type a description and press ENTER",
+                    True, theme["text_dim"])
+                screen.blit(hint, hint.get_rect(
+                    center=(SCREEN_WIDTH // 2, status_y + 20)))
+
+            back = font_tiny.render(
+                "ESC to cancel", True, theme["text_dim"])
+            screen.blit(back, back.get_rect(
+                midbottom=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 8)))
 
         elif state == "forge":
             theme = UI_THEMES[ui_theme_idx]
